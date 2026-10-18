@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Green Horizon</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1b2a1f;font-family:"Trebuchet MS",system-ui,sans-serif}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ===== GREEN HORIZON =====
+// Goal: collect seeds, dodge smog, and watch the dead world turn green.
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H, G, S;                       // width, height, ground y, scale
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const mix = (a, b, t) => { const x = hex(a), y = hex(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], t))).join(',')})`; };
+
+function resize() {
+  const d = devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight; S = H / 720;
+  cv.width = W * d; cv.height = H * d;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  G = H * 0.78;
+}
+addEventListener('resize', resize); resize();
+
+// ----- game state -----
+let state = 'menu', t = 0, off = 0, speed = 0, gv = 0;   // gv = how green the world is (0..1)
+let seeds = 0, lives = 3, spawnT = 0, treeT = 0, best = 0;
+let items = [], parts = [], trees = [];
+try { best = +localStorage.getItem('gh_best') || 0; } catch (e) {}
+const P = { x: 0, y: 0, vy: 0, r: 22, jumps: 0, inv: 0, sq: 1, air: false, shield: 0, magnet: 0 };
+let paused = false, nt = 0;   // nt = how dark it is (0 day .. 1 night)
+
+// ----- sound effects (made with the Web Audio API, no files needed) -----
+let ac, muted = false;
+function beep(freq, dur, type = 'sine', vol = 0.15, slide = 0) {
+  if (muted) return;
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, ac.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(freq + slide, ac.currentTime + dur);
+    g.gain.setValueAtTime(vol, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
+    o.connect(g); g.connect(ac.destination);
+    o.start(); o.stop(ac.currentTime + dur);
+  } catch (e) {}
+}
+const sfx = {
+  jump: () => beep(320, 0.15, 'square', 0.08, 300),
+  seed: () => { beep(660, 0.1); setTimeout(() => beep(990, 0.15), 70); },
+  hit:  () => beep(180, 0.35, 'sawtooth', 0.18, -120),
+  over: () => beep(220, 0.6, 'triangle', 0.2, -160)
+};
+
+function reset() {
+  seeds = 0; lives = 3; items = []; parts = []; spawnT = 1;
+  P.r = 22 * S; P.x = W * 0.2; P.y = G - P.r; P.vy = 0; P.jumps = 0; P.inv = 0; P.air = false; P.shield = 0; P.magnet = 0;
+}
+reset();
+
+function jump() {
+  if (state !== 'play') { if (state === 'over' && t - overAt < 0.6) return; state = 'play'; reset(); gv = 0; return; }
+  if (P.jumps < 2) {
+    P.vy = (P.jumps === 0 ? -720 : -640) * S; P.jumps++; P.air = true; P.sq = 1.3; sfx.jump();
+    burst(P.x, P.y + P.r, 6, '#cfe8b0', 80);
+  }
+}
+let overAt = 0;
+addEventListener('keydown', e => { if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) { e.preventDefault(); if (!e.repeat) jump(); } });
+cv.addEventListener('pointerdown', jump);
+addEventListener('keydown', e => {
+  if (e.code === 'KeyM') muted = !muted;                       // M = mute / unmute
+  if (e.code === 'KeyP' && state === 'play') paused = !paused; // P = pause / resume
+});
+
+function burst(x, y, n, c, sp) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), v = rand(0.3, 1) * sp * S;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 40 * S, life: 0, max: rand(0.4, 0.9), c, s: rand(2, 5) * S });
+  }
+}
+
+// ----- update -----
+function update(dt) {
+  t += dt;
+  const play = state === 'play';
+  speed = play ? (300 + Math.min(seeds * 4, 320)) * S : (state === 'menu' ? 140 : 50) * S;
+  off += speed * dt;
+  const target = state === 'menu' ? 0.5 + 0.5 * Math.sin(t * 0.4) : 1 - Math.exp(-seeds / 22);
+  gv += (target - gv) * Math.min(1, dt * 2);
+  const nightTarget = state !== 'menu' && Math.floor(seeds / 50) % 2 === 1 ? 1 : 0;
+  nt += (nightTarget - nt) * Math.min(1, dt * 0.9);
+
+  if (play) {
+    // player physics
+    P.vy += 1900 * S * dt; P.y += P.vy * dt;
+    if (P.y >= G - P.r) {
+      if (P.air) { P.sq = 0.7; burst(P.x, G, 5, '#b9a77a', 70); }
+      P.y = G - P.r; P.vy = 0; P.jumps = 0; P.air = false;
+    }
+    P.inv = Math.max(0, P.inv - dt);
+    P.shield = Math.max(0, P.shield - dt);
+    P.magnet = Math.max(0, P.magnet - dt);
+
+    // spawn seeds + smog
+    spawnT -= dt;
+    if (spawnT <= 0) {
+      spawnT = rand(380, 640) * S / speed;
+      if (Math.random() < 0.08) {
+        items.push({ k: 'shield', x: W + 60, y: G - rand(60, 160) * S, r: 16 * S, ph: rand(0, 6) });
+      } else if (Math.random() < 0.07) {
+        items.push({ k: 'magnet', x: W + 60, y: G - rand(60, 160) * S, r: 16 * S, ph: rand(0, 6) });
+      } else if (Math.random() < 0.58) {
+        const n = 3 + Math.floor(Math.random() * 3), base = G - rand(50, 190) * S;
+        for (let i = 0; i < n; i++)
+          items.push({ k: 'seed', x: W + 60 + i * 52 * S, y: base - Math.sin(i / (n - 1) * Math.PI) * 55 * S, r: 13 * S, ph: rand(0, 6) });
+      } else {
+        const fly = Math.random() < 0.35, r = (fly ? 30 : 33) * S;
+        items.push({ k: 'smog', x: W + 80, y: fly ? G - rand(110, 185) * S : G - r * 0.85, r, ph: rand(0, 6) });
+      }
+    }
+    // move + collide
+    for (const it of items) {
+      it.x -= speed * dt;
+      if (it.k === 'seed' && P.magnet > 0) {            // magnet pulls nearby seeds to the player
+        const dx = P.x - it.x, dy = P.y - it.y, dd = Math.hypot(dx, dy);
+        if (dd < 280 * S && dd > 1) { it.x += dx / dd * 520 * S * dt; it.y += dy / dd * 520 * S * dt; }
+      }
+      const d = Math.hypot(it.x - P.x, it.y - P.y);
+      if (it.k === 'seed' && !it.dead && d < P.r + it.r + 6 * S) {
+        it.dead = true; seeds++; sfx.seed(); burst(it.x, it.y, 12, '#e8ff7a', 150);
+      } else if (it.k === 'magnet' && !it.dead && d < P.r + it.r) {
+        it.dead = true; P.magnet = 6; sfx.seed(); burst(it.x, it.y, 14, '#ff8fa3', 150);
+      } else if (it.k === 'shield' && !it.dead && d < P.r + it.r) {
+        it.dead = true; P.shield = 5; sfx.seed(); burst(it.x, it.y, 14, '#7fd3ff', 150);
+      } else if (it.k === 'smog' && !it.dead && P.shield > 0 && d < P.r + it.r * 0.78) {
+        it.dead = true; sfx.hit(); burst(it.x, it.y, 18, '#7fd3ff', 160);
+      } else if (it.k === 'smog' && !it.dead && P.inv <= 0 && d < P.r + it.r * 0.78) {
+        it.dead = true; lives--; sfx.hit(); P.inv = 1.6; P.vy = -420 * S; burst(it.x, it.y, 18, '#4a4a46', 160);
+        if (lives <= 0) {
+          state = 'over'; overAt = t; sfx.over();
+          if (seeds > best) { best = seeds; try { localStorage.setItem('gh_best', best); } catch (e) {} }
+        }
+      }
+    }
+    items = items.filter(i => !i.dead && i.x > -120);
+  }
+
+  // trees (they scroll with the ground; they turn lush as the world greens)
+  treeT -= dt;
+  if (treeT <= 0) { treeT = lerp(2.4, 0.7, gv) * rand(0.7, 1.3); trees.push({ x: W + 80, s: rand(0.7, 1.2) * S }); }
+  for (const tr of trees) tr.x -= speed * dt;
+  trees = trees.filter(tr => tr.x > -120);
+
+  for (const p of parts) { p.life += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * S * dt; }
+  parts = parts.filter(p => p.life < p.max);
+  P.sq += (1 - P.sq) * Math.min(1, dt * 10);
+}
+
+// ----- drawing helpers -----
+function hills(base, amp, f, par, col) {
+  ctx.beginPath(); ctx.moveTo(0, H);
+  const o = off * par;
+  for (let x = 0; x <= W + 10; x += 10)
+    ctx.lineTo(x, base + Math.sin((x + o) * f) * amp + Math.sin((x + o) * f * 2.3 + 1.7) * amp * 0.4);
+  ctx.lineTo(W, H); ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+}
+function blob(x, y, r, col) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+function txt(s, x, y, size, col, align = 'center', weight = 'bold') {
+  ctx.font = `${weight} ${size * S}px "Trebuchet MS",system-ui,sans-serif`;
+  ctx.textAlign = align; ctx.shadowColor = 'rgba(0,0,0,.45)'; ctx.shadowBlur = 8 * S;
+  ctx.fillStyle = col; ctx.fillText(s, x, y); ctx.shadowBlur = 0;
+}
+
+function drawWorld() {
+  // sky: smoggy brown -> clear blue as gv grows
+  const sky = ctx.createLinearGradient(0, 0, 0, G);
+  sky.addColorStop(0, mix('#6d6a58', '#4fa8e8', gv));
+  sky.addColorStop(1, mix('#b8a073', '#e6f7c8', gv));
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // sun rises with the horizon
+  const sx = W * 0.78, sy = lerp(G - 30 * S, H * 0.2, gv);
+  const glow = ctx.createRadialGradient(sx, sy, 0, sx, sy, 220 * S);
+  glow.addColorStop(0, `rgba(255,236,160,${0.35 + gv * 0.5})`); glow.addColorStop(1, 'rgba(255,236,160,0)');
+  ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
+  blob(sx, sy, 38 * S, mix('#c98a4a', '#fff3b0', gv));
+
+  // clouds
+  for (let i = 0; i < 6; i++) {
+    const span = W + 400, raw = i * 330 * S - off * 0.04 * (1 + i * 0.3);
+    const cx = ((raw % span) + span) % span - 200, cy = (60 + i * 34) * S;
+    ctx.globalAlpha = 0.85; const c = mix('#5d5a50', '#ffffff', gv);
+    blob(cx, cy, 26 * S, c); blob(cx + 28 * S, cy + 4 * S, 20 * S, c); blob(cx - 28 * S, cy + 6 * S, 18 * S, c);
+    ctx.globalAlpha = 1;
+  }
+
+  hills(G - 210 * S, 50 * S, 0.004, 0.08, mix('#7a7664', '#7cc9a0', gv));
+  hills(G - 130 * S, 40 * S, 0.006, 0.20, mix('#6a6650', '#4fae6c', gv));
+  hills(G - 55 * S, 26 * S, 0.009, 0.45, mix('#58513a', '#2f9a52', gv));
+
+  // smog haze near the horizon
+  const haze = ctx.createLinearGradient(0, G - 260 * S, 0, G);
+  haze.addColorStop(0, 'rgba(120,105,70,0)'); haze.addColorStop(1, `rgba(120,105,70,${0.45 * (1 - gv)})`);
+  ctx.fillStyle = haze; ctx.fillRect(0, G - 260 * S, W, 260 * S);
+
+  // trees
+  for (const tr of trees) {
+    const x = tr.x, s = tr.s, top = G - 95 * s;
+    ctx.fillStyle = mix('#3d3224', '#6b4a2b', gv); ctx.fillRect(x - 5 * s, top + 20 * s, 10 * s, 75 * s);
+    const leaf = mix('#6a6552', '#2fa84f', gv), k = lerp(0.4, 1, gv);
+    blob(x, top + 10 * s, 30 * s * k, leaf);
+    blob(x - 20 * s * k, top + 28 * s, 22 * s * k, leaf);
+    blob(x + 20 * s * k, top + 28 * s, 22 * s * k, mix('#6a6552', '#38c05c', gv));
+    if (gv > 0.6) { blob(x - 8 * s, top + 4 * s, 4 * s, '#ff6b6b'); blob(x + 14 * s, top + 18 * s, 4 * s, '#ffd166'); }
+  }
+
+  // ground + grass
+  const gr = ctx.createLinearGradient(0, G, 0, H);
+  gr.addColorStop(0, mix('#6b5d3d', '#3fa34a', gv)); gr.addColorStop(1, mix('#2b2417', '#1f4d28', gv));
+  ctx.fillStyle = gr; ctx.fillRect(0, G, W, H - G);
+  ctx.fillStyle = mix('#7f7048', '#63d46a', gv);
+  const gap = 22 * S, o = off % gap;
+  for (let x = -o; x < W + gap; x += gap) {
+    const h = lerp(3, 13, gv) * S * (0.6 + 0.4 * Math.sin(x * 0.7));
+    ctx.beginPath(); ctx.moveTo(x, G + 2); ctx.lineTo(x + 4 * S, G - h); ctx.lineTo(x + 8 * S, G + 2); ctx.fill();
+  }
+  if (gv > 0.5) for (let x = -(off % (70 * S)); x < W; x += 70 * S) blob(x + 12 * S, G + 8 * S, 3.5 * S, x % 140 < 70 ? '#ff8fb1' : '#fff176');
+}
+
+function drawNight() {
+  if (nt < 0.01) return;
+  ctx.fillStyle = `rgba(8,14,48,${0.6 * nt})`; ctx.fillRect(0, 0, W, H);       // dark blue tint
+  for (let i = 0; i < 60; i++) {                                                // twinkling stars
+    const x = (i * 97.3) % W, y = (i * 53.7) % (G - 80 * S);
+    ctx.globalAlpha = nt * (0.5 + 0.5 * Math.sin(t * 2 + i));
+    blob(x, y, (1 + (i % 3) * 0.6) * S, '#fff');
+  }
+  ctx.globalAlpha = nt; blob(W * 0.2, H * 0.18, 34 * S, '#f1f1ff'); blob(W * 0.2 + 12 * S, H * 0.18 - 6 * S, 30 * S, '#cfd3f5');
+  ctx.globalCompositeOperation = 'lighter';                                     // fireflies
+  for (let i = 0; i < 14; i++) {
+    const x = (((i * 211 * S - off * 0.3) % W) + W) % W;
+    const y = G - (30 + (i * 37) % 160) * S + Math.sin(t * 1.5 + i) * 12 * S;
+    ctx.globalAlpha = nt * (0.5 + 0.5 * Math.sin(t * 3 + i * 2));
+    blob(x, y, 3 * S, '#e8ff7a');
+  }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawItems() {
+  for (const it of items) {
+    if (it.k === 'seed') {
+      const bob = Math.sin(t * 4 + it.ph) * 5 * S, y = it.y + bob;
+      const g = ctx.createRadialGradient(it.x, y, 0, it.x, y, it.r * 3);
+      g.addColorStop(0, 'rgba(232,255,122,.65)'); g.addColorStop(1, 'rgba(232,255,122,0)');
+      ctx.fillStyle = g; ctx.fillRect(it.x - it.r * 3, y - it.r * 3, it.r * 6, it.r * 6);
+      blob(it.x, y, it.r, '#a6e22e'); blob(it.x - 3 * S, y - 4 * S, it.r * 0.4, '#f4ffc2');
+    } else if (it.k === 'smog') {
+      // smog monster: wobbling dark blobs with angry eyes
+      const w = Math.sin(t * 5 + it.ph) * 3 * S, r = it.r;
+      ctx.globalAlpha = 0.95;
+      blob(it.x, it.y + w, r, '#3b3a38'); blob(it.x - r * 0.7, it.y + r * 0.2 - w, r * 0.7, '#4a4946'); blob(it.x + r * 0.7, it.y + r * 0.25 + w, r * 0.65, '#464542');
+      ctx.globalAlpha = 1;
+      blob(it.x - 9 * S, it.y - 4 * S, 5 * S, '#ff4d4d'); blob(it.x + 9 * S, it.y - 4 * S, 5 * S, '#ff4d4d');
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 3 * S; ctx.beginPath();
+      ctx.moveTo(it.x - 15 * S, it.y - 13 * S); ctx.lineTo(it.x - 4 * S, it.y - 8 * S);
+      ctx.moveTo(it.x + 15 * S, it.y - 13 * S); ctx.lineTo(it.x + 4 * S, it.y - 8 * S); ctx.stroke();
+    } else if (it.k === 'shield') {
+      const y = it.y + Math.sin(t * 4 + it.ph) * 5 * S;
+      ctx.strokeStyle = '#7fd3ff'; ctx.lineWidth = 3 * S; ctx.fillStyle = 'rgba(127,211,255,.25)';
+      ctx.beginPath(); ctx.arc(it.x, y, it.r, 0, 7); ctx.fill(); ctx.stroke();
+    } else if (it.k === 'magnet') {
+      const y = it.y + Math.sin(t * 4 + it.ph) * 5 * S, r = 11 * S;
+      ctx.lineWidth = 7 * S; ctx.lineCap = 'round'; ctx.strokeStyle = '#ff5d73';
+      ctx.beginPath(); ctx.arc(it.x, y, r, Math.PI, 0); ctx.moveTo(it.x - r, y); ctx.lineTo(it.x - r, y + 10 * S);
+      ctx.moveTo(it.x + r, y); ctx.lineTo(it.x + r, y + 10 * S); ctx.stroke();
+      ctx.strokeStyle = '#fff'; ctx.beginPath();
+      ctx.moveTo(it.x - r, y + 12 * S); ctx.lineTo(it.x - r, y + 16 * S);
+      ctx.moveTo(it.x + r, y + 12 * S); ctx.lineTo(it.x + r, y + 16 * S); ctx.stroke(); ctx.lineCap = 'butt';
+    }
+  }
+}
+
+function drawPlayer() {
+  if (P.inv > 0 && Math.floor(P.inv * 14) % 2) return;       // flicker when hurt
+  const run = !P.air && state !== 'over' ? Math.abs(Math.sin(t * 12)) * -4 * S : 0;
+  const hgt = (G - P.r) - P.y;
+  ctx.fillStyle = 'rgba(0,0,0,.25)';                          // shadow
+  ctx.beginPath(); ctx.ellipse(P.x, G + 3 * S, P.r * (1 - hgt / (400 * S)), 5 * S, 0, 0, 7); ctx.fill();
+  ctx.save(); ctx.translate(P.x, P.y + P.r + run); ctx.scale(1 / Math.max(P.sq, 0.7), P.sq); ctx.translate(0, -P.r);
+  const r = P.r, b = ctx.createRadialGradient(-r * 0.3, -r * 0.4, 2, 0, 0, r * 1.2);
+  b.addColorStop(0, '#d8ff8a'); b.addColorStop(1, '#2e9d4f');
+  ctx.fillStyle = b; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+  // leaves on top
+  const sw = Math.sin(t * 6) * 4 * S;
+  ctx.fillStyle = '#4ccf6a';
+  ctx.beginPath(); ctx.moveTo(0, -r * 0.9); ctx.quadraticCurveTo(-r * 0.9 + sw, -r * 1.9, -r * 1.2 + sw, -r * 1.2); ctx.quadraticCurveTo(-r * 0.4, -r * 1.1, 0, -r * 0.9); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(0, -r * 0.9); ctx.quadraticCurveTo(r * 0.9 + sw, -r * 2.0, r * 1.2 + sw, -r * 1.3); ctx.quadraticCurveTo(r * 0.4, -r * 1.1, 0, -r * 0.9); ctx.fill();
+  // eyes
+  blob(-r * 0.3, -r * 0.1, r * 0.26, '#fff'); blob(r * 0.35, -r * 0.1, r * 0.26, '#fff');
+  blob(-r * 0.22, -r * 0.08, r * 0.12, '#12301c'); blob(r * 0.43, -r * 0.08, r * 0.12, '#12301c');
+  ctx.strokeStyle = '#12301c'; ctx.lineWidth = 2 * S; ctx.beginPath(); ctx.arc(r * 0.05, r * 0.25, r * 0.22, 0.2, Math.PI - 0.2); ctx.stroke();
+  ctx.restore();
+  // shield bubble (blinks when about to run out)
+  if (P.shield > 0 && (P.shield > 1.5 || Math.floor(P.shield * 8) % 2)) {
+    ctx.strokeStyle = 'rgba(127,211,255,.9)'; ctx.lineWidth = 3 * S; ctx.fillStyle = 'rgba(127,211,255,.18)';
+    ctx.beginPath(); ctx.arc(P.x, P.y, P.r * 1.6, 0, 7); ctx.fill(); ctx.stroke();
+  }
+  if (P.magnet > 0) {                                           // pulsing pink ring while magnet is on
+    ctx.strokeStyle = 'rgba(255,93,115,.6)'; ctx.lineWidth = 2 * S;
+    ctx.beginPath(); ctx.arc(P.x, P.y, P.r * (2 + 0.3 * Math.sin(t * 8)), 0, 7); ctx.stroke();
+  }
+}
+
+function drawParticles() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of parts) { ctx.globalAlpha = 1 - p.life / p.max; blob(p.x, p.y, p.s, p.c); }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawHUD() {
+  const m = 22 * S;
+  blob(m + 12 * S, m + 14 * S, 11 * S, '#a6e22e');
+  txt(String(seeds), m + 32 * S, m + 24 * S, 30, '#fff', 'left');
+  // horizon bar
+  const bw = 220 * S, bx = m, by = m + 44 * S;
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(bx, by, bw, 12 * S);
+  const bg = ctx.createLinearGradient(bx, 0, bx + bw, 0); bg.addColorStop(0, '#8a7f5a'); bg.addColorStop(1, '#5be37d');
+  ctx.fillStyle = bg; ctx.fillRect(bx, by, bw * gv, 12 * S);
+  txt('horizon ' + Math.round(gv * 100) + '%', bx, by + 32 * S, 15, '#fff', 'left', 'normal');
+  for (let i = 0; i < 3; i++) txt('♥', W - m - i * 34 * S, m + 26 * S, 32, i < lives ? '#ff5d73' : 'rgba(255,255,255,.28)', 'right');
+}
+
+function panel(title, lines) {
+  ctx.fillStyle = 'rgba(10,25,15,.55)'; ctx.fillRect(0, 0, W, H);
+  txt(title, W / 2, H * 0.34, 74, '#d8ff8a');
+  lines.forEach((l, i) => txt(l, W / 2, H * 0.34 + (58 + i * 40) * S, i === lines.length - 1 ? 24 : 20, i === lines.length - 1 ? '#fff' : '#e3efd8', 'center', i === lines.length - 1 ? 'bold' : 'normal'));
+}
+
+function draw() {
+  drawWorld(); drawNight(); drawItems(); drawPlayer(); drawParticles();
+  if (state === 'play') drawHUD();
+  if (state === 'menu') panel('Green Horizon', ['Collect seeds. Dodge the smog.', 'Bring the horizon back to life.', 'Press SPACE or tap to start  ·  double-jump allowed']);
+  if (state === 'over') panel('The smog won this round', ['You planted ' + seeds + ' seeds  ·  best ' + best, 'Press SPACE or tap to try again']);
+  if (paused && state === 'play') panel('Paused', ['Press P to resume']);
+  if (muted) txt('muted (M)', W - 22 * S, H - 20 * S, 16, '#fff', 'right', 'normal');
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000); last = now;
+  if (!paused) update(dt);
+  draw(); requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
